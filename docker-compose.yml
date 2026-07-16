@@ -1,0 +1,152 @@
+# GeoNova — combined stack (backend + frontend behind an nginx proxy).
+#
+#   docker compose up --build     # build + start (force a rebuild)
+#   docker compose down           # stop
+#
+# Only nginx is published to the host (port 8080). The FastAPI backend and the
+# Next.js frontend are reachable solely through the proxy — they have no
+# `ports:` mapping of their own.
+#
+# Routing (see nginx/nginx.conf): the backend API is namespaced under /api/
+# (stripped before reaching FastAPI), so /api/embeddings, /api/downstream and
+# /api/chat/* go to the backend; /docs, /redoc and /openapi.json also go to the
+# backend; everything else (incl. the /embeddings and /downstream *pages*) goes
+# to the frontend. The frontend's baked-in backend URL is the same origin under
+# that prefix:
+#   NEXT_PUBLIC_BACKEND_URL=http://localhost:8080/api
+# (override per-session in the in-app Backend URL field, or rebuild to change
+# the default).
+#
+# The backend boots once VLLM_BASE_URL *or* OLLAMA_BASE_URL is set (see
+# geonova/.env). If that LLM endpoint runs on the *host* rather than in another
+# compose service, reach it via `host.docker.internal` (mapped on the backend
+# below), e.g. VLLM_BASE_URL=http://host.docker.internal:8003/v1.
+
+services:
+  db:
+    image: postgres:18.1
+    container_name: geonova-db
+    restart: unless-stopped
+    volumes:
+      - postgres_data:/var/lib/postgresql
+    environment:
+      - POSTGRES_DB=geonova
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: [ "CMD", "pg_isready", "-U", "postgres" ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+  # ── Backend: GeoNova FastAPI ───────────────────────────────────────────────
+  # Modeled on geonova/docker-compose.yml — same GPU passthrough, checkpoint
+  # mount, env_file and host-gateway mapping; only the published `ports:` block
+  # is dropped (the proxy fronts it instead).
+  geonova:
+    build:
+      context: ./geonova
+      dockerfile: docker/Dockerfile
+    image: geonova:dev
+    container_name: geonova-backend
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    # No host port — nginx proxies to geonova:8000.
+    expose:
+      - "8000"
+    environment:
+      # Model weights are mounted as a volume below; point the app at the mount.
+      FALCON_CHECKPOINT_PATH: /checkpoints/falcon
+    env_file:
+      - ./geonova/.env
+    volumes:
+      # Falcon checkpoint (~1.4 GB) is not baked into the image — mount it ro.
+      - ./geonova/src/embedding_models/falcon/checkpoint:/checkpoints/falcon:ro
+    # NVIDIA GPU passthrough (Blackwell sm_120). Requires the NVIDIA Container
+    # Toolkit on the host; falls back to CPU if you drop this block and torch
+    # finds no CUDA device.
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    # Lets the container reach host services (e.g. a locally-run vLLM/Ollama) by name.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/openapi.json"]
+      interval: 30s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
+
+  # ── Frontend: GeoNova Next.js (standalone) ────────────────────────────────
+  geonova-frontend:
+    build:
+      context: ./geonova-frontend
+      dockerfile: docker/Dockerfile
+      args:
+        # Build-time (public) var inlined into the client bundle. Same origin as
+        # the proxy, under the /api prefix nginx strips before hitting the
+        # backend (the FE ships /embeddings and /downstream *pages* at the root,
+        # so the backend API must be namespaced). Change this default → rebuild.
+        NEXT_PUBLIC_BACKEND_URL: ${NEXT_PUBLIC_BACKEND_URL:-http://localhost:8080/api}
+    image: geonova-frontend:latest
+    container_name: geonova-frontend
+    restart: unless-stopped
+
+    # No host port — nginx proxies to geonova-frontend:3000.
+    expose:
+      - "3000"
+
+    environment:
+      NODE_ENV: production
+
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+
+  # ── Proxy: nginx ───────────────────────────────────────────────────────────
+  nginx:
+    image: nginx:1.27-bookworm
+    container_name: geonova-nginx
+    restart: unless-stopped
+
+    # The only port published to the host.
+    ports:
+      - "8080:8080"
+
+    # Mount the *directory* (not the single file): a single-file bind mount is
+    # pinned to one inode, so editing nginx.conf on the host (which replaces the
+    # file) is invisible to the container until a full restart. A directory mount
+    # resolves the file path fresh on each read, so `docker exec nginx -s reload`
+    # picks up edits live.
+    volumes:
+      - ./nginx:/etc/nginx/geonova:ro
+
+    # Point nginx at our config inside the mounted directory.
+    command: ["nginx", "-c", "/etc/nginx/geonova/nginx.conf", "-g", "daemon off;"]
+
+    depends_on:
+      geonova:
+        condition: service_healthy
+      geonova-frontend:
+        condition: service_healthy
+
+    healthcheck:
+      test: ["CMD", "service", "nginx", "status"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  postgres_data:
