@@ -1,0 +1,6 @@
+[submodule "geonova-frontend"]
+	path = geonova-frontend
+	url = ctsekes:DionysosKM/geonova-frontend.git
+[submodule "geonova"]
+	path = geonova
+	url = ctsekes:EleftheriaTtl/geonova.git
